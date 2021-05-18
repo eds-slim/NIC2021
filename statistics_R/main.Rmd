@@ -74,8 +74,10 @@ d.plot.vol <- d.clinical %>%
   nest() %>%
   mutate(
     m = map(data, ~ glm(value ~ log10(lesionvolume/1000), family = "quasipoisson", data = ., na.action = na.exclude)),
-    prs = map(m, ~ predict(., type = "response", se.fit = TRUE)),
-    pris = map2(prs, data, ~ data.frame("pest" = .x[[1]], "lwr" = .x[[1]] - .x[[2]], "upr" = .x[[1]] + .x[[2]], subID = .y$subID)),
+    prs = map(m, ~ predict(., type = "link", se.fit = TRUE)),
+    pris = pmap(list(prs, data, m), function(x,y,z){data.frame("pest" = z$family$linkinv(x[[1]])
+                                                               , "lwr" = z$family$linkinv(x[[1]] - 1.96*x[[2]])
+                                                               , "upr" = z$family$linkinv(x[[1]] + 1.96*x[[2]]), subID = y$subID)}),
     c0 = map_dbl(m, ~ coefficients(.)[[1]]),
     c1 = map_dbl(m, ~ coefficients(.)[[2]]),
     dsquared.null = map_dbl(m, ~ Dsquared(., adjust = FALSE))
@@ -213,8 +215,10 @@ d.plot.LND <- dd %>%
     m = map(data, ~ glm(value ~ loc.value, family = "quasipoisson", data = ., na.action = na.exclude)),
     m.vol = map(data, ~ glm(value ~ loc.value + log(lesionvolume), family = "quasipoisson", data = ., na.action = na.omit)),
     m.vol.reg = map(data, ~ glm(value ~ loc.value + log(lesionvolume), family = "poisson", data = ., na.action = na.omit)),
-    prs = map(m, ~ predict(., type = "response", se.fit = TRUE)),
-    pris = map2(prs, data, ~ data.frame("pest" = .x[[1]], "lwr" = .x[[1]] - .x[[2]], "upr" = .x[[1]] + .x[[2]], subID = .y$subID)),
+    prs = map(m, ~ predict(., type = "link", se.fit = TRUE)),
+    pris = pmap(list(prs, data, m), function(x,y,z){data.frame("pest" = z$family$linkinv(x[[1]])
+                                                               , "lwr" = z$family$linkinv(x[[1]] - 1.96*x[[2]])
+                                                               , "upr" = z$family$linkinv(x[[1]] + 1.96*x[[2]]), subID = y$subID)}),
     c0 = map_dbl(m, ~ coefficients(.)[[1]]),
     c1 = map_dbl(m, ~ coefficients(.)[[2]]),
     dsquared = map_dbl(m, Dsquared),
