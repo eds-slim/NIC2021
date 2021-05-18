@@ -272,7 +272,6 @@ p.LND <- lapply(unique(dd$mod), function(modality) {
 ```
 
 ## Modelling
-Stratified by ARATY/RASP, T1/T3 und ChaCo/NoDe
 ```{r}
 d.p.adjust <- d.plot.LND %>%
   unnest(tidy.vol) %>%
@@ -334,7 +333,7 @@ for (modality in c('RASP')) { #unique(dd$mod)
 }
 ```
 
-### Cortical destruction
+### Cortical involvement
 
 
 #### Plot
@@ -495,15 +494,6 @@ p.comb <- cowplot::plot_grid(p.LND[[2]], p.LND.clinical[[3]]
                              , labels = "AUTO"
                              , label_x = .1) %>% print()
 
-#p.comb <- p.LND[[2]] + p.LND.clinical[[3]] + 
-#  (cowplot::ggdraw() + cowplot::draw_image('./../figure_creation/sigROIs/finished.png') 
-   # + 
-    # geom_mark_circle(aes(x = 0.45, y = 0.7, label = 'Postcentral'), con.type = 'elbow', label.buffer = unit(1,'cm')) +
-    # geom_mark_circle(aes(x = 0.5, y = 0.35, label = 'Transverse temporal'), con.type = 'elbow', label.buffer = unit(1,'cm')) +
-    # geom_mark_circle(aes(x = 0.45, y = 0.5, label = 'Supramarginal'), con.type = 'elbow', label.buffer = unit(1,'cm'))
-#     ) +
-#  plot_layout(ncol = 1) +
-#  plot_annotation(tag_levels = 'A', tag_suffix = ')') & theme(plot.tag = element_text(size = #6))
 
 p.comb
 
