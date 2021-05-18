@@ -1,0 +1,519 @@
+---
+title: "ToposSC"
+author: "ES"
+output: html_document
+#output:   
+#  redoc::redoc:
+#  highlight_output: FALSE
+#output: bookdown::html_document2
+#output: pdf_document
+always_allow_html: yes
+---
+
+```{r setup, include=FALSE}
+options(bitmapType="cairo")
+
+knitr::opts_chunk$set(echo = TRUE)
+require(tidyverse)
+require(tidyselect)
+require(ggplot2)
+require(lme4)
+
+require(broom)
+require(flextable)
+require(fitdistrplus)
+require(lmtest)
+require(modEvA)
+require(modelr)
+require(drlib)
+require(ggthemes)
+require(ggthemr)
+ggthemr("fresh")
+```
+
+# Load data
+```{r}
+asz <- 86
+source("auxfuncs.r")
+source("prepdata.r")
+
+#d.clinical <- d.clinical %>% slice(-c(1,66))
+```
+# Lesion volume 
+```{r}
+quantile(d.clinical$lesionvolume/1000)
+```
+
+
+# Distribution of clinical data
+
+## RASP
+```{r}
+d.clinical %>% 
+  group_by(mod, time) %>%
+  summarise(quantile(value, na.rm=T), q = c(0, 0.25, 0.5, 0.75, 1))
+  
+d.clinical %>% 
+  spread(key = time, value = value) %>% 
+  ggplot(aes(x = T1, y = T3))+
+  geom_point()
+  
+d.clinical %>% 
+  spread(key = time, value = value) %>% 
+  group_by(mod) %>% 
+  nest() %>% 
+  mutate(mdl = map(data, ~glm(T3 ~ I(T1/10), family = "quasipoisson", data = ., na.action = na.exclude))
+         , tidy = map(mdl, ~tidy(., conf.int = TRUE, exponentiate=T))) %>% 
+  unnest(tidy)
+```
+
+
+```{r plotvolregression, message=FALSE, warning=FALSE}
+d.plot.vol <- d.clinical %>%
+  group_by(time, mod) %>%
+  nest() %>%
+  mutate(
+    m = map(data, ~ glm(value ~ log10(lesionvolume/1000), family = "quasipoisson", data = ., na.action = na.exclude)),
+    prs = map(m, ~ predict(., type = "response", se.fit = TRUE)),
+    pris = map2(prs, data, ~ data.frame("pest" = .x[[1]], "lwr" = .x[[1]] - .x[[2]], "upr" = .x[[1]] + .x[[2]], subID = .y$subID)),
+    c0 = map_dbl(m, ~ coefficients(.)[[1]]),
+    c1 = map_dbl(m, ~ coefficients(.)[[2]]),
+    dsquared.null = map_dbl(m, ~ Dsquared(., adjust = FALSE))
+  )
+
+
+d.plot.vol %>%
+  transmute(
+    pest = map_dbl(m, ~ (tidy(., conf.int = TRUE) %>% pull("estimate"))[[2]] %>% exp()),
+    lwr = map_dbl(m, ~ (tidy(., conf.int = TRUE) %>% pull("conf.low"))[[2]] %>% exp()),
+    upr = map_dbl(m, ~ (tidy(., conf.int = TRUE) %>% pull("conf.high"))[[2]] %>% exp()),
+    p = map_dbl(m, ~ (tidy(., conf.int = TRUE) %>% pull("p.value"))[[2]])
+  )
+
+
+d.clinical %>%
+  group_by(mod) %>%
+  nest() %>%
+  mutate(
+    m = map(data, ~ glmer(value ~ log10(lesionvolume/1000) * time + (1 | subID), family = "poisson", data = ., na.action = na.omit)),
+    tidy = map(m, broom.mixed::tidy),
+    adj = map(m, adj.quasi)
+  ) %>%
+  unnest(adj)
+
+grid.vol <- with(d.clinical, seq(min(lesionvolume), max(lesionvolume), length = 1e5))
+d.curve.vol <- plyr::ddply(d.plot.vol, ~ time + mod, function(df) {
+  data.frame(
+    lesionvolume = grid.vol,
+    curve.vol = exp(df$c0 + df$c1 * log10(grid.vol/1000))
+  )
+})
+
+data.cv <- d.clinical %>% filter(time=='T1' & mod == 'RASP')
+m.cv <- glm(value ~ log10(lesionvolume/1000), family = "quasipoisson", data = data.cv, na.action = na.exclude)
+highInf <- car::influencePlot(m.cv) %>% rownames() %>% as.numeric()
+m.cv2 <- glm(value ~ log10(lesionvolume/1000), family = "quasipoisson", data = data.cv[-highInf, ], na.action = na.exclude) 
+m.cv2 %>% tidy(conf.int = TRUE, exponentiate  = TRUE)
+m.cv2 %>% Dsquared(., adjust = FALSE)
+
+p.vol <- d.plot.vol %>%
+  unnest(c(pris, data), names_repair = "unique") %>%
+  filter(mod == 'RASP' & time == 'T1') %>% 
+  bind_cols(gdata::read.xls('./../../clinical/MRdate_lesionsites.xlsx', sheet = 1) %>% 
+              as_tibble() %>% 
+              dplyr::select(Probanden.ID, `diff.mri.onset.`, `X.4`) %>%
+              dplyr::filter(!is.na(Probanden.ID))
+            ) %>% 
+  mutate(compartment = as.character(X.4)
+         , compartment = case_when(stringr::str_starts(compartment, 'comb') ~ 'combined'
+                                   , compartment %in% c('brain stem', 'cerebellar') ~ 'hind brain'
+                                   , TRUE ~ compartment)) %>% 
+  ggplot(aes(x = lesionvolume/1000, y = value, group = time)) +
+  geom_point(aes(shape = compartment, color = if_else(`subID...3` %in% highInf, 'red', 'blue')), alpha = .5, size = 1) +
+  geom_line(aes(y = curve.vol), d.curve.vol %>% filter(mod == 'RASP' & time == 'T1')) +
+  geom_errorbar(aes(ymin = lwr, ymax = upr), alpha = .25) +
+  geom_point(aes(y = pest), fill = "white", shape = 21, size = .25) +
+  theme_minimal() +
+  #facet_grid(~mod) +
+  scale_x_continuous("Lesion volume [ml]", trans = "log10", breaks = c(0.1, 1, 10, 100, 1000), labels = c(expression(10^{~"-"~01}), scientific_10(c(1, 10, 100, 1000)))) +
+  scale_y_continuous("Somatosensory deficit [193-RASP]") +
+  scale_shape_manual(name = "Phase", values = c(13, 1, 2, 4)) +
+  scale_color_manual(name = "Phase", values = c(swatch()[2],'darkred'), labels = c("Acute", "Chronic")) +
+  guides(color = FALSE, group=FALSE, shape=FALSE) + # time = guide_legend(title = "Phase", )
+  theme(
+    legend.position = c(.2, .8),
+    panel.grid.minor = element_blank()
+  )
+p.vol
+ggsave("./../../derivatives/figures/statsplots/vol_RASP.png"
+       , plot = p.vol
+       , units = "cm", width = 8, height = 8)
+```
+
+```{r}
+require(boot)
+
+
+stat.fcn <- function(data, indices){
+  data <- data[indices, ]
+  m.cv <- glm(value ~ log10(lesionvolume/1000), family = "quasipoisson", data = data, na.action = na.exclude)
+  return(summary(m.cv)$coefficients[2,4])
+}
+
+boot.out <- boot(data.cv, stat.fcn, R = 10)
+
+boot.out
+```
+
+
+# NeMo: Univariate analysis
+
+## Descriptive
+```{r, message=FALSE, warning=FALSE}
+dd %>%
+  gather(loc.mod, loc.value, nemoscore, quotient) %>%
+  group_by(ROI, loc.mod) %>%
+  summarise(
+    mean = mean(loc.value),
+    mean.pos = mean(loc.value[loc.value > 0]),
+    prop.pos = mean(loc.value > 0),
+    std = sd(loc.value)
+    # , median = median(loc.value)
+    # , min = min(loc.value)
+    , lwr = quantile(loc.value, 0.25),
+    upr = quantile(loc.value, 0.75)
+    # , max = max(loc.value)
+  ) %>%
+  gather(var, stats, -c(ROI, loc.mod)) %>%
+  unite(temp, loc.mod, var) %>%
+  spread(temp, stats) %>%
+  arrange(-nemoscore_prop.pos, -nemoscore_mean.pos) %>% 
+  dplyr::select(ROI, nemoscore_prop.pos, nemoscore_mean.pos, quotient_prop.pos, quotient_mean.pos, ) %>% 
+  mutate(ROI = forcats::fct_relabel(ROI, ~ROIlabelsnice[.])) %>% 
+  flextable() %>% 
+  colformat_double(j = 2:5, digits = 4)
+```
+```{r}
+dd.wide <- dd %>%
+  dplyr::select(-c(lab, lobe)) %>%
+  distinct() %>%
+  spread(key = ROI, value = nemoscore)
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+dfun <- function(object) {
+with(object,sum((weights * residuals^2)[weights > 0])/df.residual)
+}
+d.plot.LND <- dd %>%
+  gather(loc.mod, loc.value, nemoscore, quotient) %>%
+  group_by(time, ROI, mod, loc.mod) %>%
+  nest() %>%
+  mutate(
+    m = map(data, ~ glm(value ~ loc.value, family = "quasipoisson", data = ., na.action = na.exclude)),
+    m.vol = map(data, ~ glm(value ~ loc.value + log(lesionvolume), family = "quasipoisson", data = ., na.action = na.omit)),
+    m.vol.reg = map(data, ~ glm(value ~ loc.value + log(lesionvolume), family = "poisson", data = ., na.action = na.omit)),
+    prs = map(m, ~ predict(., type = "response", se.fit = TRUE)),
+    pris = map2(prs, data, ~ data.frame("pest" = .x[[1]], "lwr" = .x[[1]] - .x[[2]], "upr" = .x[[1]] + .x[[2]], subID = .y$subID)),
+    c0 = map_dbl(m, ~ coefficients(.)[[1]]),
+    c1 = map_dbl(m, ~ coefficients(.)[[2]]),
+    dsquared = map_dbl(m, Dsquared),
+    dsquared.vol = map_dbl(m.vol, ~ Dsquared(., adjust = TRUE)),
+    tidy = map(m, tidy),
+    tidy.vol = map(m.vol, ~broom::tidy(., conf.int = FALSE)),
+    AIC.vol = map_dbl(m.vol.reg,  ~bbmle::qAIC(., dispersion=dfun(.)))
+  )
+
+
+grid.LND <- seq(0, 1, length.out = 1e2)
+d.curve.LND <- plyr::ddply(d.plot.LND, ~ time + ROI + mod + loc.mod, function(df) {
+  data.frame(
+    loc.value = grid.LND,
+    curve = exp(df$c0 + df$c1 * grid.LND)
+  )
+})
+
+
+ROIs <- c("Postcentral", "Supramarginal", "Transversetemporal","Caudate")
+p.LND <- lapply(unique(dd$mod), function(modality) {
+  p.LND <- d.plot.LND %>%
+    filter(ROI %in% ROIs & mod == modality & time == 'T1') %>%
+    mutate(ROI = factor(ROI, levels = ROIs)) %>% 
+    unnest(c(pris, data), names_repair = "unique") %>%
+    ggplot(aes(x = loc.value, y = value, group = loc.mod)) +
+    geom_point(aes(shape = loc.mod, color = loc.mod), alpha = .5, size = .75) +
+    facet_wrap( ~ ROI, scales = "free", nrow = 2) +
+    geom_line(aes(y = curve, color = loc.mod), d.curve.LND %>% filter(ROI %in% ROIs & mod == modality & time == 'T1'), alpha = .2) +
+    geom_errorbar(aes(ymin = lwr, ymax = upr, color = loc.mod), alpha = .25) +
+    geom_point(aes(y = pest, color = loc.mod), fill = "white", shape = 21, size = .2) +
+    theme_minimal() +
+    scale_x_continuous("Local network disruption") +
+    scale_y_continuous("Somatosensory deficit [193 - RASP]") +
+    coord_cartesian(ylim = c(0, 200)) +
+    scale_shape_discrete(name = "Phase", labels = c("Acute", "Chronic")) +
+    scale_color_manual(name = "Phase", values = swatch()[c(6,5)]) +
+    scale_fill_manual(values = c("red", "blue")) +
+    guides(color = FALSE, shape = FALSE, fill = FALSE) +
+      theme(
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5),
+        axis.title=element_text(size=6,face="bold"), 
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.text = element_text(size = 5),
+        strip.text = element_text(size = 6)
+      )
+
+  print(p.LND)
+  ggsave(paste0("./../../derivatives/figures/statsplots/LND_", modality, ".png")
+         , plot =  p.LND
+         , units = "cm", width = 18, height = 8)
+  return(p.LND)
+})
+```
+
+## Modelling
+Stratified by ARATY/RASP, T1/T3 und ChaCo/NoDe
+```{r}
+d.p.adjust <- d.plot.LND %>%
+  unnest(tidy.vol) %>%
+  filter(term == "loc.value") %>%
+  dplyr::select(p.LND = p.value, ROI) %>%
+  ungroup() %>%
+  group_by(time, mod, loc.mod) %>%
+  nest() %>%
+  mutate(p.LND.adj = map(data, ~ (p.adjust(.$p.LND, method = "holm")))) %>%
+  unnest(c(p.LND.adj, data))
+```
+
+```{r echo=TRUE}
+source('MUtable.r')
+temp
+```
+
+```{r eval=FALSE, message=FALSE, warning=FALSE, include=FALSE}
+res <- character()
+for (modality in c('RASP')) { #unique(dd$mod)
+  for (phase in c('T1')) { unique(dd$time)
+    for (loc.modality in unique(d.plot.LND$loc.mod)) {
+      tab <- d.plot.LND %>%
+        merge(d.plot.vol %>% dplyr::select(dsquared.null)) %>%
+        dplyr::select(time, ROI, mod, loc.mod, tidy.vol, dsquared.null, dsquared.vol, AIC.vol) %>%
+        unnest(tidy.vol) %>%
+        mutate(deltaD = dsquared.vol - dsquared.null) %>%
+        merge(d.p.adjust) %>%
+        arrange(p.LND, term) %>%
+        filter(term != "(Intercept)" & time == phase & mod == modality & loc.mod == loc.modality) %>%
+        dplyr::select(-c(dsquared.null, statistic, p.LND)) %>%
+        flextable() %>%
+        bold(i = ~ p.LND.adj < 0.05 & term == "log(lesionvolume)", j = ~p.LND.adj) %>%
+        flextable::set_header_labels(values = list(
+          ROI = "",
+          term = "",
+          estimate = "Estimate",
+          std.error = "SE",
+          p.value = "P",
+          dsquared.vol = "D^2",
+          deltaD = "Delta D^2",
+          p.LND.adj = "P-NeMo-adj"
+        )) %>%
+        set_formatter(values = list(
+          p.value = pvalformatter,
+          p.LND.adj = pvalformatter,
+          estimate = function(x) sprintf("%1.2f", x),
+          AIC.vol = function(x) sprintf("%1.2f", x),
+          std.error = function(x) sprintf("%1.2f", x),
+          dsquared.vol = function(x) sprintf("%1.4f", x),
+          deltaD = function(x) sprintf("%1.4f", x)
+        )) %>%
+        merge_v(j = ~ ROI + p.LND.adj + dsquared.vol + deltaD + AIC.vol)
+      
+      cat(knitr::knit_print(tab))
+
+    }
+  }
+}
+```
+
+### Cortical destruction
+
+
+#### Plot
+```{r}
+dd %>%
+  ggplot(aes(x = quotient, y = nemoscore)) +
+  geom_point(size = .75, alpha = .5) +
+  geom_smooth(method = "lm", se = T, size = 0.5) +
+  facet_wrap(~ROI, labeller = as_labeller(ROIlabelsnice)) +
+  scale_x_continuous('Gray matter disruption (NoDe score)', breaks = c(0, 0.5, 1), labels = c('0', '0.5', '1')) +
+  scale_y_continuous('White matter disruption (ChaCo score)', breaks = c(0, 0.5, 1), labels = c('0', '0.5', '1')) +
+  theme_minimal()+
+  theme(strip.text = element_text(size = 6))
+ggsave(paste0("./../../derivatives/figures/statsplots/SFig_ChaCo_NeMo.png")
+         , units = "cm", width = 18, height = 18)
+```
+
+```{r, message=FALSE, warning=FALSE}
+f <- c(
+  "vol" = "log(lesionvolume)",
+  "nemo" = "nemoscore",
+  "CD" = "quotient",
+  "nemo.CD" = "nemoscore + quotient",
+  "nemo.vol" = "nemoscore + log(lesionvolume)",
+  "CD.vol" = "quotient + log(lesionvolume)",
+  "nemo.CD.vol" = "nemoscore + quotient + log(lesionvolume)",
+  "nemo.resCD" = "nemoscore + res.CD.nemo",
+  "CD.resnemo" = "quotient + res.nemo.CD",
+  "vol.resCD" = "log(lesionvolume) + res.CD.vol",
+  "vol.resCD.resnemo" = "log(lesionvolume) + res.CD.vol + res.nemo.CD.vol",
+  "vol.resnemo" = "log(lesionvolume) + res.nemo.vol",
+  "vol.resnemo.resCD" = "log(lesionvolume) + res.nemo.vol + res.CD.nemo.vol"
+)
+d.plot.all <- dd %>%
+  group_by(time, ROI, mod) %>%
+  nest() %>%
+  mutate(
+    res.nemo.CD = map(data, ~ resid(lm(nemoscore ~ quotient, data = .))),
+    res.nemo.CD.vol = map(data, ~ resid(lm(nemoscore ~ quotient + log(lesionvolume), data = .))),
+    res.CD.nemo = map(data, ~ resid(lm(quotient ~ nemoscore, data = .))),
+    res.CD.nemo.vol = map(data, ~ resid(lm(quotient ~ nemoscore + log(lesionvolume), data = .))),
+    res.CD.vol = map(data, ~ resid(lm(quotient ~ log(lesionvolume), data = .))),
+    res.nemo.vol = map(data, ~ resid(lm(nemoscore ~ log(lesionvolume), data = .)))
+  ) %>%
+  unnest(c(data, starts_with("res."))) %>%
+  nest() %>%
+  tidyr::expand_grid(f) %>%
+  group_by(time, ROI, mod, f) %>%
+  mutate(
+    m = map2(data, f, ~ glm(as.formula(paste("value ~ ", .y)), family = "quasipoisson", data = .x, na.action = na.exclude)),
+    D2 = map_dbl(m, Dsquared),
+    tidy = map(m, tidy)
+  )
+
+f.vol <- f[c("vol", "vol.resCD", "vol.resCD.resnemo")] # c('log(lesionvolume)', 'log(lesionvolume) + res.CD.vol', 'log(lesionvolume) + res.CD.vol + res.nemo.CD.vol')
+f.vol.inv <- f[c("vol", "vol.resnemo", "vol.resnemo.resCD")] # c('log(lesionvolume)', 'log(lesionvolume) + res.nemo.vol', 'log(lesionvolume) + res.nemo.vol + res.CD.nemo.vol')
+temp <- d.plot.all %>%
+  unnest(tidy) %>%
+  filter(f %in% c(f.vol, f.vol.inv, "quotient", "quotient + res.nemo.CD", "nemoscore", "nemoscore + res.CD.nemo")) %>%
+  # filter(time == 'RASP_T3') %>%
+  filter((f == "log(lesionvolume)" & term == "log(lesionvolume)")
+  | (f == "log(lesionvolume) + res.CD.vol" & term == "res.CD.vol")
+  | (f == "log(lesionvolume) + res.CD.vol + res.nemo.CD.vol" & term == "res.nemo.CD.vol")
+  | (f == "log(lesionvolume) + res.nemo.vol" & term == "res.nemo.vol")
+  | (f == "log(lesionvolume) + res.nemo.vol + res.CD.nemo.vol" & term == "res.CD.nemo.vol")
+  | (f == "quotient" & term == "quotient")
+  | (f == "quotient + res.nemo.CD" & term == "res.nemo.CD")
+  | (f == "nemoscore" & term == "nemoscore")
+  | (f == "nemoscore + res.CD.nemo" & term == "res.CD.nemo")) %>%
+  dplyr::select(ROI, D2, f, p.value, estimate) %>%
+  filter(!ROI %in% c("Frontalpole", "Rostralanteriorcingulate")) %>%
+  droplevels() %>%
+  group_by(ROI, time, mod) %>%
+  mutate(incD2 = case_when(
+    f == "log(lesionvolume)" ~ 0 # D2[f=='log(lesionvolume)']
+    , f == "log(lesionvolume) + res.CD.vol" ~ D2[f == "log(lesionvolume) + res.CD.vol"] - D2[f == "log(lesionvolume)"],
+    f == "log(lesionvolume) + res.CD.vol + res.nemo.CD.vol" ~ D2[f == "log(lesionvolume) + res.CD.vol + res.nemo.CD.vol"] - D2[f == "log(lesionvolume) + res.CD.vol"],
+    f == "log(lesionvolume) + res.nemo.vol" ~ D2[f == "log(lesionvolume) + res.nemo.vol"] - D2[f == "log(lesionvolume)"],
+    f == "log(lesionvolume) + res.nemo.vol + res.CD.nemo.vol" ~ D2[f == "log(lesionvolume) + res.nemo.vol + res.CD.nemo.vol"] - D2[f == "log(lesionvolume) + res.nemo.vol"],
+    f == "quotient" ~ D2[f == "quotient"],
+    f == "quotient + res.nemo.CD" ~ D2[f == "quotient + res.nemo.CD"] - D2[f == "quotient"]
+  ))
+
+
+ggthemr('fresh')
+sw <- swatch() %>% as.character()
+sw.new <- sw
+sw.new[c(2,3)] <- sw.new[c(5,6)]
+sw.new[c(6,5)] <- sw.new[c(5,6)]
+
+d.sig.all <- d.plot.all %>%
+  filter(f %in% c("nemoscore + quotient + log(lesionvolume)", "log(lesionvolume)")) %>%
+  dplyr::select(ROI, time, f, m) %>%
+  spread(key = f, value = m) %>%
+  mutate(aov = map2(`log(lesionvolume)`, `nemoscore + quotient + log(lesionvolume)`, ~ anova(.x, .y, test = "Rao"))) %>%
+  unnest(aov) %>%
+  filter(!is.na(Df)) %>%
+  ungroup() %>%
+  group_by(time, mod) %>%
+  nest() %>%
+  mutate(p.adj = map(data, ~ p.adjust(.$`Pr(>Chi)`, method = "holm"))) %>%
+  unnest(c(data, p.adj)) %>%
+  arrange(p.adj) %>%
+  dplyr::select(ROI, time, p.adj)
+
+p.LND.clinical <- list()
+j <- 0
+for (modality in unique(dd$mod)) {
+  for (phase in unique(dd$time)) {
+    j <- j+1
+    p <- temp %>%
+      merge(temp) %>%
+      merge(d.sig.all) %>%
+      mutate(fam = case_when(
+        f %in% f.vol ~ "CD.first",
+        f %in% f.vol.inv ~ "NeMo.first",
+        TRUE ~ "else"
+      )) %>%
+      filter(fam != "else") %>%
+      droplevels() %>%
+      filter(time == phase & mod == modality) %>%
+      group_by(ROI, time, mod) %>%
+      mutate(D2max = max(D2)  - D2[f == 'log(lesionvolume)']) %>%
+      mutate(f = factor(f, levels = levels(as.factor(f))[c(3, 2, 1, 6, 5, 4)])) %>%
+      mutate(ROI = forcats::fct_relabel(ROI, ~ROIlabelsnice[.])) %>% 
+      ggplot(aes(x = reorder(ROI, -D2max), y = incD2, fill = f), size = 5) +
+      geom_col(aes(alpha = case_when(p.value < 0.05 ~ 9, TRUE ~ 1)), position = position_stack(reverse = FALSE)) +
+      geom_text(aes(y = D2max, label = case_when(p.adj < 0.05 ~ "*", TRUE ~ ""))) +
+      facet_wrap( ~ fam, scales = "free_y", ncol = 1, labeller = as_labeller(c("CD.first" = "Preferential allocation of variation to grey matter damage", "NeMo.first" = "Preferential allocation of variation to white matter damage"))) +
+      scale_x_discrete("") +
+      scale_y_continuous("SSD explained by local network disruption", expand = expansion(mult = c(0,0.1)), labels = scales::label_percent()) +
+      guides(alpha = FALSE) +
+      scale_alpha_continuous(range = c(.2, 1)) +
+      scale_fill_manual(values = sw.new[c(6,5,4,5,6)]) +
+      #coord_cartesian(ylim = c(0, .2)) +
+      theme_minimal() +
+      guides(fill = FALSE) +
+      theme(
+        axis.text.x = element_text(angle = 90, hjust = 1, vjust = .5),
+        axis.title=element_text(size=6,face="bold"), 
+        panel.grid.major.x = element_blank(),
+        panel.grid.minor.x = element_blank(),
+        axis.text = element_text(size = 5),
+        strip.text = element_text(size = 6)
+      )
+    
+    print(p)
+    p.LND.clinical[[j]] <- p
+    ggsave(paste("./../../derivatives/figures/statsplots/deviance", modality, phase, ".png", sep = "_"),
+      plot = p,
+      units = "cm",
+      width = 8, height = 8
+    )
+  }
+}
+
+p.comb <- cowplot::plot_grid(p.LND[[2]], p.LND.clinical[[3]]
+                             , labels = "AUTO"
+                             , label_x = .1) %>% print()
+
+#p.comb <- p.LND[[2]] + p.LND.clinical[[3]] + 
+#  (cowplot::ggdraw() + cowplot::draw_image('./../figure_creation/sigROIs/finished.png') 
+   # + 
+    # geom_mark_circle(aes(x = 0.45, y = 0.7, label = 'Postcentral'), con.type = 'elbow', label.buffer = unit(1,'cm')) +
+    # geom_mark_circle(aes(x = 0.5, y = 0.35, label = 'Transverse temporal'), con.type = 'elbow', label.buffer = unit(1,'cm')) +
+    # geom_mark_circle(aes(x = 0.45, y = 0.5, label = 'Supramarginal'), con.type = 'elbow', label.buffer = unit(1,'cm'))
+#     ) +
+#  plot_layout(ncol = 1) +
+#  plot_annotation(tag_levels = 'A', tag_suffix = ')') & theme(plot.tag = element_text(size = #6))
+
+p.comb
+
+ggsave(paste("./../../derivatives/figures/statsplots/LNDclindeviance.png", sep = "_"),
+       plot = p.comb,
+      units = "cm",
+      width = 8, height = 20
+    )
+
+```
+
+
+
